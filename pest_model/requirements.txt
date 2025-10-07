@@ -1,0 +1,10 @@
+torch>=1.12.0
+torchvision
+timm
+albumentations
+opencv-python
+numpy
+scikit-learn
+tqdm
+PyYAML
+matplotlib

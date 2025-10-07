@@ -1,0 +1,20 @@
+# Ignore checkpoints and model weights
+checkpoints/
+*.pth
+*.pt
+
+# Ignore cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore confusion matrix images
+confusion_matrix.png
+
+# Ignore system files
+.DS_Store
+Thumbs.db
+
+# Ignore events and tensorboard logs
+events.out.tfevents.*

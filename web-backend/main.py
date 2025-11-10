@@ -60,6 +60,7 @@ arduino_port = os.environ.get("ARDUINO_PORT", "COM9")
 arduino_baud = int(os.environ.get("ARDUINO_BAUD", 9600))
 arduino_serial = None
 pest_timer = None
+arduino_lock = threading.Lock()
 PEST_CONFIDENCE_THRESHOLD = float(os.environ.get("PEST_CONFIDENCE_THRESHOLD", 0.8))
 PEST_DEFAULT_DURATION = int(os.environ.get("PEST_DEFAULT_DURATION", 10))
 
@@ -69,10 +70,38 @@ def init_serial():
         print("[WARN] pyserial not installed; serial buzzer control disabled.")
         return
     try:
-        arduino_serial = serial.Serial(arduino_port, arduino_baud, timeout=1)
-        # give Arduino time to reset if needed
-        time.sleep(2)
-        print(f"[DEBUG] Opened serial on {arduino_port} @ {arduino_baud}")
+        # Try opening configured port first
+        try:
+            arduino_serial = serial.Serial(arduino_port, arduino_baud, timeout=1)
+            time.sleep(2)
+            print(f"[DEBUG] Opened serial on {arduino_port} @ {arduino_baud}")
+        except Exception as e_start:
+            print(f"[WARN] Could not open configured serial port {arduino_port}: {e_start}")
+            # Auto-detect available ports and try to open an Arduino-like device
+            try:
+                from serial.tools import list_ports
+                ports = list(list_ports.comports())
+                print(f"[DEBUG] Available serial ports: {[p.device + ' (' + (p.description or '') + ')' for p in ports]}")
+                opened = False
+                # heuristic: prefer ports with 'Arduino' or 'USB' in description, else try all
+                candidates = [p.device for p in ports if ('arduino' in (p.description or '').lower() or 'usb' in (p.description or '').lower())]
+                if not candidates:
+                    candidates = [p.device for p in ports]
+                for dev in candidates:
+                    try:
+                        arduino_serial = serial.Serial(dev, arduino_baud, timeout=1)
+                        time.sleep(2)
+                        print(f"[DEBUG] Auto-opened serial on {dev} @ {arduino_baud}")
+                        opened = True
+                        break
+                    except Exception as e_try:
+                        print(f"[DEBUG] Failed to open {dev}: {e_try}")
+                if not opened:
+                    arduino_serial = None
+                    print("[WARN] Auto-detect failed: no usable serial port found.")
+            except Exception as e_list:
+                arduino_serial = None
+                print(f"[WARN] Failed to list serial ports: {e_list}")
         # start background reader thread so Arduino debug lines appear in backend logs
         def _reader():
             print("[DEBUG] Arduino serial reader thread started")
@@ -101,18 +130,63 @@ def init_serial():
         print(f"[WARN] Failed to open serial port {arduino_port}: {e}")
 
 def send_cmd(cmd: str):
+    """Send a command to the Arduino with retries and a lock to avoid concurrent writes.
+
+    This wrapper ensures commands are newline-terminated, uses a lock so multiple threads
+    don't write simultaneously, retries on failure, and attempts to re-open the serial
+    port if a write fails.
+    """
     global arduino_serial
-    try:
-        if arduino_serial and arduino_serial.is_open:
-            arduino_serial.write((cmd + "\n").encode())
-            print(f"[DEBUG] Sent to Arduino: {cmd}")
-        else:
-            print(f"[WARN] Serial not available; would send: {cmd}")
-    except Exception as e:
-        print(f"[ERROR] Failed sending serial command {cmd}: {e}")
+    max_attempts = 3
+    attempt = 0
+    last_exc = None
+    while attempt < max_attempts:
+        attempt += 1
+        try:
+            if not (arduino_serial and getattr(arduino_serial, 'is_open', False)):
+                print(f"[WARN] Serial not available on attempt {attempt}; trying to (re)initialize")
+                init_serial()
+            if arduino_serial and getattr(arduino_serial, 'is_open', False):
+                with arduino_lock:
+                    # ensure a newline so Arduino can read lines reliably
+                    data = (cmd + "\n").encode('ascii', errors='ignore')
+                    arduino_serial.write(data)
+                    try:
+                        arduino_serial.flush()
+                    except Exception:
+                        # flush may not be available on some Serial wrappers; ignore
+                        pass
+                print(f"[DEBUG] Sent to Arduino: {cmd} (attempt {attempt})")
+                return
+            else:
+                print(f"[WARN] Serial still not available after init on attempt {attempt}")
+        except Exception as e:
+            last_exc = e
+            print(f"[ERROR] Failed sending serial command {cmd} on attempt {attempt}: {e}")
+            # attempt to reinitialize the serial connection and retry
+            try:
+                init_serial()
+            except Exception as e2:
+                print(f"[ERROR] init_serial() during retry failed: {e2}")
+            time.sleep(0.2)
+            continue
+    # if we reached here, all attempts failed
+    print(f"[ERROR] Giving up sending serial command {cmd} after {max_attempts} attempts. Last error: {last_exc}")
 
 def send_pest_on():
+    # kept for compatibility: default on without explicit duration
     send_cmd("PEST_ON")
+
+
+def send_pest_on_with_duration(seconds: int):
+    """Send PEST_ON with a duration parameter that the Arduino can use for autonomous auto-off.
+    This is preferred to relying only on the backend timer, because the Arduino will then turn itself off
+    even if the backend or the network has issues.
+    """
+    if seconds is None:
+        send_cmd("PEST_ON")
+    else:
+        send_cmd(f"PEST_ON {int(seconds)}")
 
 def send_pest_off():
     send_cmd("PEST_OFF")
@@ -172,22 +246,25 @@ async def predict(file: UploadFile = File(...)):
                 response["warning"] = "Low confidence (<50%). Prediction may be unreliable."
             # --- Auto-trigger buzzer if prediction is confident ---
             try:
-                if confidence >= PEST_CONFIDENCE_THRESHOLD:
-                    print(f"[DEBUG] Confidence >= {PEST_CONFIDENCE_THRESHOLD}, triggering pest alarm")
-                    # cancel existing timer
-                    try:
-                        if pest_timer and pest_timer.is_alive():
-                            pest_timer.cancel()
-                    except Exception:
-                        pass
-                    send_pest_on()
-                    # schedule off after default duration
-                    pest_timer = threading.Timer(PEST_DEFAULT_DURATION, send_pest_off)
-                    pest_timer.start()
-                    response["pest_alert"] = True
-                    response["pest_alert_duration"] = PEST_DEFAULT_DURATION
-                else:
-                    response["pest_alert"] = False
+                # Always trigger buzzer when a prediction is made. Use confidence to scale duration.
+                # Duration is at least 1s and at most PEST_DEFAULT_DURATION seconds.
+                secs = max(1, int(round(float(confidence) * float(PEST_DEFAULT_DURATION))))
+                print(f"[DEBUG] Triggering pest alarm for {secs}s (confidence={confidence})")
+                global pest_timer
+                # cancel existing timer
+                try:
+                    if pest_timer and pest_timer.is_alive():
+                        pest_timer.cancel()
+                        print("[DEBUG] Cancelled existing pest_timer")
+                except Exception:
+                    pass
+                # instruct Arduino (device will auto-off) and keep a backend backup timer
+                send_pest_on_with_duration(secs)
+                pest_timer = threading.Timer(secs + 1, send_pest_off)
+                pest_timer.start()
+                print(f"[DEBUG] Started backup pest_timer for {secs+1}s")
+                response["pest_alert"] = True
+                response["pest_alert_duration"] = secs
             except Exception as e:
                 print(f"[ERROR] Failed to auto-trigger pest alarm: {e}")
             return JSONResponse(response)

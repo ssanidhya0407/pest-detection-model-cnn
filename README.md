@@ -155,6 +155,44 @@ This project is provided under the MIT License — see `LICENSE` (or add one if 
 
 If you want, I can make the README even more interactive by adding GIFs of the UI, a short video link, or a GitHub Actions workflow badge showing the backend tests. Tell me which extras you'd like and I will add them.
 
+## Adding new images (how to extend dataset)
+
+1. Create a folder `new_images/` at the repository root and place your new pictures inside subfolders named by class, for example:
+
+```
+new_images/
+  armyworm/
+    img001.jpg
+    img002.jpg
+  aphids/
+    img100.jpg
+```
+
+2. Run the ingestion script (from project root). This will copy files into `pest/train/<class>/` and `pest/test/<class>/` using an 80/20 split by default:
+
+```powershell
+python scripts/ingest_new_data.py --source new_images --dest pest --train-ratio 0.8
+```
+
+Options:
+- `--move` : move files instead of copying
+- `--train-ratio 0.9` : change split ratio
+- `--seed 123` : reproducible shuffling
+
+3. Verify the files appear under `pest/train/<class>` and `pest/test/<class>`.
+
+4. Retrain the model using the same training script:
+
+```powershell
+# using the project venv recommended
+C:/Users/vinay/OneDrive/Desktop/Pests_CNN/.venv/Scripts/python.exe pest_model/train.py --data-dir pest --epochs 30 --batch-size 16
+```
+
+Notes:
+- The ingestion script will avoid filename collisions by appending a short uuid if a file with the same name already exists.
+- The trainer (`pest_model/train.py`) expects the dataset root to contain `train/` and `test/` subfolders with per-class directories.
+
+
 # Pest Detection Web App
 
 This project provides an end-to-end pest detection system with a modern web interface and a FastAPI backend serving a trained CNN model.
